@@ -25,21 +25,28 @@ harness is the prompt, which the orchestrator passes into ``harness.run()``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
+import shlex
 import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from slime.agent import sandbox as agent_sandbox
 from slime.agent.adapters.common import flatten_content
-from slime.agent.sandbox import E2BSandbox, Sandbox, exec_and_wait
+from slime.agent.sandbox import Sandbox, create_sandbox, exec_and_wait
 from slime.utils.types import Sample
 
 try:
     from swebench.harness.grading import get_eval_report  # type: ignore
-    from swebench.harness.test_spec.test_spec import make_test_spec  # type: ignore
+    try:
+        # SWE-bench >= 4.x.
+        from swebench.harness.test_spec.test_spec import make_test_spec  # type: ignore
+    except ModuleNotFoundError:
+        # SWE-Gym's pinned SWE-Bench-Fork exposes test_spec as a module.
+        from swebench.harness.test_spec import make_test_spec  # type: ignore
 
     _SWEBENCH_IMPORT_ERROR: Exception | None = None
 except Exception as _exc:  # pragma: no cover - import-time diagnostic
@@ -228,7 +235,16 @@ async def apply_pre_commands(sb: Sandbox, workdir: str, pre: list[str] | str) ->
 # Diff capture (agent sandbox, after harness.run)
 # ---------------------------------------------------------------------------
 async def git_diff(sb: Sandbox, workdir: str) -> str:
-    cmd = f"cd {workdir} && git add -N . && git diff -- . ':(exclude)PROBLEM_STATEMENT.md' ':(exclude).harness/'"
+    pathspecs = (
+        ".",
+        ":(exclude)PROBLEM_STATEMENT.md",
+        ":(exclude,glob).harness/**",
+        ":(exclude,glob)**/__pycache__/**",
+        ":(exclude,glob)**/*.py[cod]",
+        ":(exclude,glob)**/.pytest_cache/**",
+    )
+    paths = " ".join(shlex.quote(path) for path in pathspecs)
+    cmd = f"cd {shlex.quote(workdir)} && git add -N -- {paths} && git diff -- {paths}"
     _, out, _ = await sb.exec(cmd, user="agent", timeout=120)
     return out
 
@@ -266,7 +282,7 @@ async def _grade_scaleswe(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
         logger.warning("[swe.scaleswe] no swepro/eval_cmd/f2p_script; reward=0")
         return EvalResult(0.0, True)
 
-    async with E2BSandbox(image) as ev:
+    async with create_sandbox(image) as ev:
         await agent_sandbox.ensure_agent_user(ev, workdir)
         if swepro:
             await _setup_swepro_assets(ev, swepro)
@@ -300,17 +316,31 @@ async def _apply_diff(ev: Sandbox, workdir: str, diff_text: str) -> bool:
     if not diff_text.strip():
         return True
     await ev.write_file(_PATCH, diff_text, user="agent")
-    # First-success-wins ladder collapsed into one exec (one sandbox round-trip).
-    ladder = " || ".join(
-        f"({cmd})"
-        for cmd in (
-            f"git apply --3way --whitespace=nowarn {_PATCH}",
+    commands = (
+        (
+            "git apply",
+            f"git apply --check --whitespace=nowarn {_PATCH} && "
             f"git apply --whitespace=nowarn {_PATCH}",
+        ),
+        (
+            "git apply --3way",
+            f"git apply --3way --check --whitespace=nowarn {_PATCH} && "
+            f"git apply --3way --whitespace=nowarn {_PATCH}",
+        ),
+        (
+            "patch -p1",
+            f"patch --dry-run -p1 --no-backup-if-mismatch < {_PATCH} && "
             f"patch -p1 --no-backup-if-mismatch < {_PATCH}",
-        )
+        ),
     )
-    ec, _, _ = await ev.exec(f"cd {workdir} && ({ladder})", user="agent", check=False, timeout=120)
-    return ec == 0
+    diagnostics: list[str] = []
+    for label, cmd in commands:
+        ec, out, err = await ev.exec(f"cd {workdir} && {cmd}", user="agent", check=False, timeout=120)
+        if ec == 0:
+            return True
+        diagnostics.append(f"{label}: exit={ec}, stdout={out[-1000:]!r}, stderr={err[-1000:]!r}")
+    logger.warning("[swe.apply_diff] all patch methods failed:\n%s", "\n".join(diagnostics))
+    return False
 
 
 async def _run_swepro(ev: Sandbox, workdir: str, swepro: dict, timeout: int) -> float:
@@ -383,11 +413,19 @@ def _build_test_spec(inst: dict):
 def _eval_report_from_log(ts, instance_id: str, diff_text: str, log: str) -> dict:
     """Run swebench's get_eval_report against the captured test log. It reads
     from a file path, so write the log to a tempfile, parse, and clean up."""
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False)
-    try:
-        tmp.write(log)
-        tmp.flush()
-        tmp.close()
+    log_arg = (
+        "test_log_path"
+        if "test_log_path" in inspect.signature(get_eval_report).parameters
+        else "log_path"
+    )
+    with tempfile.TemporaryDirectory() as root:
+        # SWE-Gym's fork derives the repository name from the log's parent
+        # directory and expects the patch-application marker in that file.
+        instance_dir = Path(root) / instance_id
+        instance_dir.mkdir()
+        log_path = instance_dir / "test_output.txt"
+        payload = log if log_arg == "test_log_path" else ">>>>> Applied Patch (pred)\n" + log
+        log_path.write_text(payload)
         prediction = {
             "instance_id": instance_id,
             "model_patch": diff_text or "",
@@ -396,14 +434,9 @@ def _eval_report_from_log(ts, instance_id: str, diff_text: str, log: str) -> dic
         return get_eval_report(  # type: ignore[misc]
             test_spec=ts,
             prediction=prediction,
-            test_log_path=tmp.name,
             include_tests_status=True,
+            **{log_arg: str(log_path)},
         )
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
 
 
 def _ratio(d: dict) -> tuple[int, int]:
@@ -462,7 +495,7 @@ async def _grade_swebench(md: dict, diff_text: str, timeout_sec: int) -> EvalRes
         logger.warning("[swe.swebench] %s: missing image; reward=0", instance_id)
         return EvalResult(0.0, True)
 
-    async with E2BSandbox(image) as ev:
+    async with create_sandbox(image) as ev:
         await asyncio.gather(
             ev.write_file("/tmp/patch.diff", diff_text or "", user="root"),
             ev.write_file("/tmp/eval.sh", eval_sh, user="root"),

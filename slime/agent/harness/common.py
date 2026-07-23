@@ -135,6 +135,7 @@ async def install_npm_cli(
     await install_node22(sb, node_runtime)
 
     await sb.write_file("/tmp/harness-cli.tgz", npm_package)
+    await sb.exec("chmod 0644 /tmp/harness-cli.tgz", user="root", check=True, timeout=30)
     install_cmd = "npm install -g --prefix=/usr/local --no-audit --no-fund /tmp/harness-cli.tgz && " + check_cmd
     # Detached install with a few in-place retries for transient disk flakes.
     last_log = ""

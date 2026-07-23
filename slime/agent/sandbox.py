@@ -12,7 +12,10 @@ import asyncio
 import io
 import logging
 import os
+import posixpath
 import random
+import secrets
+import shlex
 import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -370,6 +373,155 @@ class E2BSandbox:
             )
         except Exception:
             return ""
+
+
+class DockerSandbox:
+    """Local sandbox implemented with short-lived sibling Docker containers.
+
+    This backend is intended for a slime container that has the Docker CLI and
+    the host Docker socket mounted. The task image must already exist in, or be
+    pullable by, the host daemon. Agent and evaluator containers are removed on
+    context exit, including exceptional exits.
+    """
+
+    backend_env = "SLIME_AGENT_SANDBOX_BACKEND"
+    network_env = "SLIME_AGENT_DOCKER_NETWORK"
+    binary_env = "SLIME_AGENT_DOCKER_BINARY"
+    extra_run_args_env = "SLIME_AGENT_DOCKER_EXTRA_RUN_ARGS"
+
+    def __init__(self, image: str, *, timeout: int | None = None) -> None:
+        self.image = image
+        self.timeout = timeout
+        self.network = os.environ.get(self.network_env, "").strip()
+        self.binary = os.environ.get(self.binary_env, "docker").strip() or "docker"
+        self.extra_run_args = shlex.split(os.environ.get(self.extra_run_args_env, ""))
+        self.sandbox_id = f"slime-sandbox-{secrets.token_hex(6)}"
+        self._started = False
+
+    async def _docker(
+        self,
+        *args: str,
+        input_data: bytes | None = None,
+        timeout: int = 120,
+        check: bool = True,
+    ) -> ExecResult:
+        proc = await asyncio.create_subprocess_exec(
+            self.binary,
+            *args,
+            stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(input_data), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise TimeoutError(f"docker command timed out after {timeout}s: {args[:4]}") from None
+
+        out = stdout.decode("utf-8", errors="replace")
+        err = stderr.decode("utf-8", errors="replace")
+        if check and proc.returncode != 0:
+            raise RuntimeError(f"docker command failed (exit={proc.returncode}): {' '.join(args[:6])}\n{err[-1000:]}")
+        return proc.returncode or 0, out, err
+
+    async def __aenter__(self) -> DockerSandbox:
+        args = [
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            self.sandbox_id,
+            "--label",
+            "slime.agent.sandbox=true",
+        ]
+        if self.network:
+            args.extend(["--network", self.network])
+        args.extend(self.extra_run_args)
+        args.extend([self.image, "/bin/sh", "-lc", "while :; do sleep 3600; done"])
+        try:
+            await self._docker(*args, timeout=self.timeout or 300)
+        except BaseException:
+            await self._docker("rm", "-f", self.sandbox_id, timeout=30, check=False)
+            raise
+        self._started = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._started:
+            await self._docker("rm", "-f", self.sandbox_id, timeout=60, check=False)
+            self._started = False
+
+    async def exec(
+        self,
+        cmd: str,
+        *,
+        user: str = "root",
+        env: dict[str, str] | None = None,
+        timeout: int = 120,
+        check: bool = False,
+        idempotent: bool = True,
+    ) -> ExecResult:
+        del idempotent  # Local docker exec has no transport-level retry.
+        args = ["exec", "--user", user]
+        for key, value in (env or {}).items():
+            args.extend(["--env", f"{key}={value}"])
+        args.extend([self.sandbox_id, "/bin/bash", "-lc", cmd])
+        return await self._docker(*args, timeout=timeout, check=check)
+
+    async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "root") -> None:
+        parent = posixpath.dirname(sandbox_path) or "/"
+        await self.exec(f"mkdir -p {shlex.quote(parent)}", user="root", timeout=30, check=True)
+
+        if isinstance(content, Path):
+            await self._docker("cp", "--follow-link", str(content), f"{self.sandbox_id}:{sandbox_path}", timeout=600)
+            if user != "root":
+                await self.exec(
+                    f"chown {shlex.quote(user)}:{shlex.quote(user)} {shlex.quote(sandbox_path)}",
+                    user="root",
+                    timeout=30,
+                    check=True,
+                )
+            return
+
+        data = content if isinstance(content, bytes) else content.encode("utf-8")
+        args = (
+            "exec",
+            "-i",
+            "--user",
+            "root",
+            self.sandbox_id,
+            "/bin/sh",
+            "-c",
+            f"cat > {shlex.quote(sandbox_path)}",
+        )
+        await self._docker(*args, input_data=data, timeout=600)
+        if user != "root":
+            await self.exec(
+                f"chown {shlex.quote(user)}:{shlex.quote(user)} {shlex.quote(sandbox_path)}",
+                user="root",
+                timeout=30,
+                check=True,
+            )
+
+    async def read_file(self, sandbox_path: str, *, user: str = "root") -> str:
+        ec, out, _ = await self.exec(
+            f"cat {shlex.quote(sandbox_path)}",
+            user=user,
+            timeout=120,
+            check=False,
+        )
+        return out if ec == 0 else ""
+
+
+def create_sandbox(image: str, **kwargs) -> Sandbox:
+    """Create the sandbox backend selected by ``SLIME_AGENT_SANDBOX_BACKEND``."""
+    backend = os.environ.get(DockerSandbox.backend_env, "e2b").strip().lower()
+    if backend == "e2b":
+        return E2BSandbox(image, **kwargs)
+    if backend == "docker":
+        return DockerSandbox(image, **kwargs)
+    raise ValueError(f"unsupported sandbox backend {backend!r}; expected 'e2b' or 'docker'")
 
 
 async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
