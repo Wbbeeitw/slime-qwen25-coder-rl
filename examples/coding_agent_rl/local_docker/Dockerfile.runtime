@@ -1,0 +1,7 @@
+ARG SLIME_IMAGE=slimerl/slime:latest
+FROM docker:29-cli AS docker_cli
+FROM ${SLIME_IMAGE}
+
+COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker
+
+WORKDIR /root/slime

@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends bash git passwd && \
+    pip install --no-cache-dir pytest && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY smoke_repo/ /workspace/demo/
+
+RUN cd /workspace/demo && \
+    git init && \
+    git config user.email smoke@example.invalid && \
+    git config user.name "Slime Smoke" && \
+    git add . && \
+    git commit -m "Initial buggy calculator"
+
+WORKDIR /workspace/demo
