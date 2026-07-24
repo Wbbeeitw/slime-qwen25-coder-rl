@@ -147,7 +147,7 @@ SGLANG_ARGS=(
   --sglang-mem-fraction-static "${ROLLOUT_MEM_UTILIZATION:-0.70}"
   --sglang-max-running-requests 4
   --sglang-tool-call-parser qwen25
-  --sglang-reasoning-parser qwen25
+  --sglang-reasoning-parser auto
   --sglang-mamba-scheduler-strategy extra_buffer
 )
 
