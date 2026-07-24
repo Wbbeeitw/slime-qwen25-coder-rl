@@ -7,6 +7,18 @@ if [[ "${MODE}" != rollout && "${MODE}" != train ]]; then
   exit 2
 fi
 
+# ---- GPU 数量自动检测 ----
+# 优先从 CUDA_VISIBLE_DEVICES 读取，否则从 nvidia-smi 读取
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  IFS=',' read -ra _GPU_ARR <<< "${CUDA_VISIBLE_DEVICES}"
+  NUM_GPUS="${#_GPU_ARR[@]}"
+else
+  NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+fi
+NUM_GPUS="${NUM_GPUS:-1}"
+echo "Detected GPUs: ${NUM_GPUS} (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-auto})"
+# --------------------------
+
 SLIME_DIR="${SLIME_DIR:-/root/slime}"
 HF_CHECKPOINT="${HF_CHECKPOINT:-/models/Qwen2.5-Coder-7B-Instruct}"
 REF_MODEL_PATH="${REF_MODEL_PATH:-/workspace/models/Qwen2.5-Coder-7B-Instruct_torch_dist}"
@@ -130,8 +142,8 @@ ALGO_ARGS=(
 )
 
 SGLANG_ARGS=(
-  --rollout-num-gpus 4
-  --rollout-num-gpus-per-engine 4
+  --rollout-num-gpus "${NUM_GPUS}"
+  --rollout-num-gpus-per-engine "${NUM_GPUS}"
   --sglang-mem-fraction-static "${ROLLOUT_MEM_UTILIZATION:-0.70}"
   --sglang-max-running-requests 4
   --sglang-tool-call-parser qwen25
@@ -149,7 +161,7 @@ MISC_ARGS=(
 )
 
 ray stop --force >/dev/null 2>&1 || true
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-cpus 16 --num-gpus 4 \
+ray start --head --node-ip-address "${MASTER_ADDR}" --num-cpus 16 --num-gpus "${NUM_GPUS}" \
   --object-store-memory 8589934592 \
   --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
@@ -196,7 +208,7 @@ ray job submit --address=http://127.0.0.1:8265 \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- python3 -u train.py \
   --actor-num-nodes 1 \
-  --actor-num-gpus-per-node 4 \
+  --actor-num-gpus-per-node "${NUM_GPUS}" \
   "${MODEL_ARGS[@]}" \
   "${CKPT_ARGS[@]}" \
   "${ROLLOUT_ARGS[@]}" \
