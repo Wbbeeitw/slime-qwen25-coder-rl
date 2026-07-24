@@ -148,7 +148,6 @@ SGLANG_ARGS=(
   --sglang-max-running-requests 4
   --sglang-tool-call-parser qwen25
   --sglang-reasoning-parser auto
-  --sglang-mamba-scheduler-strategy extra_buffer
 )
 
 MISC_ARGS=(
